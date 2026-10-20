@@ -257,6 +257,15 @@ if sys.platform == "win32":
     u32.GetWindow.restype = u32.GetForegroundWindow.restype = wintypes.HWND
     dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
 
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t), ("_pad", ctypes.c_ubyte * 8)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("ki", _KEYBDINPUT)]
+
+    u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+
 
 def window_text(h, fn="GetWindowTextW"):
     buf = ctypes.create_unicode_buffer(256)
@@ -368,6 +377,13 @@ def recognize(strokes, w, h, timeout=5.0):
     return [" ".join(c[0] for c in words)] + (words[0][1:4] if len(words) == 1 else [])
 
 
+def unicode_events(text):
+    """UTF-16LE (scan, flags) pairs for Win32 SendInput(KEYEVENTF_UNICODE): layout-independent, no clipboard."""
+    raw = text.encode("utf-16-le")
+    units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    return [(u, f) for u in units for f in (0x0004, 0x0006)]  # KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+
+
 def ctrl_scroll(notches):
     pyautogui.keyDown("ctrl")
     try:
@@ -378,7 +394,9 @@ def ctrl_scroll(notches):
 
 def make_detector():
     if not MODEL.exists():
-        urllib.request.urlretrieve(MODEL_URL, MODEL)
+        tmp = MODEL.with_suffix(".part")
+        urllib.request.urlretrieve(MODEL_URL, tmp)
+        tmp.replace(MODEL)
     return vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(MODEL)), running_mode=vision.RunningMode.VIDEO,
         num_hands=2, min_hand_detection_confidence=0.6, min_tracking_confidence=0.6))
@@ -643,7 +661,17 @@ class Tracker:
 
     def _type(self, text):
         # a small gap per key: at full speed Notepad dropped letters ("look ma" arrived as "look a")
-        pyautogui.write(text, interval=0.015)  # ponytail: ASCII only; non-English text needs clipboard paste
+        if text.isascii() or sys.platform != "win32":
+            pyautogui.write(text, interval=0.015)
+        else:
+            for ch in text:
+                if ch.isascii():
+                    pyautogui.write(ch, interval=0.015)
+                else:
+                    ev = (_INPUT * len(pairs := unicode_events(ch)))(*(
+                        _INPUT(1, _KEYBDINPUT(0, u, f, 0, 0)) for u, f in pairs))
+                    u32.SendInput(len(ev), ev, ctypes.sizeof(_INPUT))
+                    time.sleep(0.015)
         self.chunks.append(text)
 
     def _use_alt(self, alt):
@@ -1015,13 +1043,13 @@ class HUD:
 
 def load_config():
     try:
-        return json.loads(CONFIG.read_text())
+        return json.loads(CONFIG.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
 
 def save_config(cfg):
-    CONFIG.write_text(json.dumps(cfg))
+    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
 
 
 def open_camera(index):
@@ -1179,6 +1207,9 @@ def selftest():
     assert [n for n, _ in search_apps(apps, "spot")] == ["Spotify"]  # no loose junk like PostgreSQL
     assert window_label("Instagram - Google Chrome") == "Google Chrome\nInstagram"
     assert window_label("Wikipédia — Mozilla Firefox") == "Mozilla Firefox\nWikipédia"
+    assert unicode_events("é") == [(0x00E9, 0x0004), (0x00E9, 0x0006)]
+    if sys.platform == "win32":
+        assert ctypes.sizeof(_INPUT) == (40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28)
 
     t = Tracker(None, {}, start=False)  # every panel lays out, every tile fits on screen
     t.apps = apps

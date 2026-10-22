@@ -342,6 +342,39 @@ def search_apps(apps, query, n=5):
     return [a for a in ranked if score(a[0]) >= 0.75][:n]
 
 
+AI_CMDS = {"screenshot": ("win", "shift", "s"), "capture": ("win", "shift", "s"), "desktop": ("win", "d"),
+           "bureau": ("win", "d"), "task view": ("win", "tab"), "mute": ("volumemute",), "play": ("playpause",),
+           "pause": ("playpause",), "volume up": ("volumeup",), "volume down": ("volumedown",),
+           "maximize": "max", "minimize": "min", "close window": "close", "fermer": "close"}
+
+
+def ai_intent(prompt, apps):
+    """Fast local intent router for natural-language commands ('open spotify', 'ouvre paramètres', 'screenshot')
+    before calling an LLM. Returns ('app', (name, id)), ('key', keys), ('win', cmd), or None."""
+    q = fold(prompt)
+    for prefix in ("open ", "launch ", "start ", "run ", "ouvre ", "lance "):
+        if q.startswith(prefix) and (hits := search_apps(apps, q[len(prefix):], 1)):
+            return ("app", hits[0])
+    for phrase, target in AI_CMDS.items():
+        if phrase in q:
+            return ("win" if isinstance(target, str) else "key", target)
+    return None
+
+
+def ask_ai(prompt, cfg, timeout=8.0):
+    """Query a local (Ollama) or OpenAI-compatible chat endpoint configured in ~/.zehen.json or env."""
+    key = cfg.get("ai_key") or os.environ.get("OPENAI_API_KEY", "")
+    url = cfg.get("ai_url") or os.environ.get("ZEHEN_AI_URL") or (
+        "https://api.openai.com/v1/chat/completions" if key else "http://127.0.0.1:11434/v1/chat/completions")
+    model = cfg.get("ai_model") or ("gpt-4o-mini" if key else "llama3.2")
+    body = json.dumps({"model": model, "max_tokens": 120, "temperature": 0.2, "messages": [
+        {"role": "system", "content": "You are ZEHEN, a concise desktop HUD assistant. Reply in one short sentence."},
+        {"role": "user", "content": prompt}]}).encode("utf-8")
+    headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}
+    with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers), timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))["choices"][0]["message"]["content"].strip()
+
+
 def recognize(strokes, w, h, timeout=5.0):
     """Windows' built-in handwriting recognition (offline). strokes: lists of (x, y) screen fractions.
     Returns candidates, best first: the whole text, then alternatives when it's a single word.
@@ -392,9 +425,9 @@ class Tracker:
         self.cam, self.cfg = cam, cfg
         self.running, self.paused, self.error, self.mouse_down = True, False, None, False
         self.lock = threading.Lock()  # guards self.ink: the recognizer thread trims it while we draw into it
-        self.mode, self.search = None, False  # mode: None | "launcher" | "pad" | "keyboard"
+        self.mode, self.search, self.ai = None, False, False  # mode: None | "launcher" | "pad" | "keyboard"
         self.ink, self.stroke, self.ink_at, self.recognizing = [], None, 0.0, False
-        self.chunks, self.query, self.alts = [], "", []  # chunks: text the pad typed, so "⌫ word" can undo it
+        self.chunks, self.query, self.alts, self.ai_reply, self.ai_busy = [], "", [], "", False
         self.windows, self.apps, self.search_cache = [], [], ("", [])
         self.hover, self.pressed, self.pressed_until = None, None, 0.0
         self.flash, self.flash_until = "", 0.0
@@ -572,11 +605,12 @@ class Tracker:
 
     # --- panels: launcher, writing pad, keyboard ---
 
-    def set_mode(self, mode, search=False):
+    def set_mode(self, mode, search=False, ai=False):
         self._release()
         with self.lock:
             self.ink, self.stroke = [], None
-        self.mode, self.search, self.query, self.alts, self.chunks = mode, search, "", [], []
+        self.mode, self.search, self.ai = mode, search, ai
+        self.query, self.alts, self.chunks, self.ai_reply = "", [], [], ""
         if mode == "launcher":
             self.windows = list_windows()
 
@@ -635,7 +669,7 @@ class Tracker:
 
     def _got_text(self, cands):
         best, self.alts = cands[0], cands[1:4]
-        if self.search:
+        if self.search or self.ai:
             self.query = f"{self.query} {best}".strip()
         else:
             gap = " " if self.chunks and self.chunks[-1][-1:].isalnum() and best[:1].isalnum() else ""
@@ -647,7 +681,7 @@ class Tracker:
         self.chunks.append(text)
 
     def _use_alt(self, alt):
-        if self.search:
+        if self.search or self.ai:
             self.query = " ".join(self.query.split(" ")[:-1] + [alt])
         elif self.chunks:
             last = self.chunks.pop()
@@ -656,7 +690,7 @@ class Tracker:
         self.alts = []
 
     def _backspace(self):
-        if self.search:
+        if self.search or self.ai:
             self.query = self.query[:-1]
             return
         pyautogui.press("backspace")
@@ -666,7 +700,7 @@ class Tracker:
                 self.chunks.pop()
 
     def _delete_word(self):
-        if self.search:
+        if self.search or self.ai:
             self.query = self.query.rpartition(" ")[0]
         elif self.chunks:
             pyautogui.press("backspace", presses=len(self.chunks.pop()))
@@ -675,18 +709,51 @@ class Tracker:
         self.alts = []
 
     def _space(self):
-        if self.search:
+        if self.search or self.ai:
             self.query += " "
         else:
             self._type(" ")
 
     def _enter(self):
-        if self.search:
+        if self.ai:
+            self._ask_ai()
+        elif self.search:
             if results := self._results():
                 self._launch(*results[0])
         else:
             pyautogui.press("enter")
             self.chunks = []
+
+    def _ask_ai(self):
+        prompt = self.query.strip()
+        if not prompt or self.ai_busy:
+            return
+        if hit := ai_intent(prompt, self.apps):
+            kind, val = hit
+            if kind == "app":
+                return self._launch(*val)
+            if kind == "win":
+                window_cmd(val)
+            else:
+                pyautogui.hotkey(*val) if len(val) > 1 else pyautogui.press(val[0])
+            self._flash(f"✨  {prompt.upper()}", 1.0)
+            return self.set_mode(None)
+        self.ai_busy, self.ai_reply = True, ""
+        threading.Thread(target=self._ai_worker, args=(prompt,), daemon=True).start()
+
+    def _ai_worker(self, prompt):
+        try:
+            self.ai_reply = ask_ai(prompt, self.cfg)
+        except Exception:
+            self.ai_reply = "AI offline (set OPENAI_API_KEY or run Ollama locally)"
+        finally:
+            self.ai_busy = False
+
+    def _type_ai(self):
+        if self.ai_reply:
+            reply = self.ai_reply
+            self.set_mode(None)
+            pyautogui.write(reply, interval=0.015)
 
     def _clear_ink(self):
         with self.lock:
@@ -750,6 +817,7 @@ class Tracker:
         section("APPS", [(f"▶\n{n}", lambda n=n, a=a: self._launch(n, a)) for n, a in favs]
                 + [("🔍\nSearch all apps", lambda: self.set_mode("pad", search=True))], "")
         section("CONTROLS", [
+            ("✨\nAsk AI", lambda: self.set_mode("pad", ai=True)),
             ("⌨\nKeyboard", lambda: self.set_mode("keyboard")),
             ("✍\nWriting pad", lambda: self.set_mode("pad")),
             ("📂\nFiles", self._then_close(open_folder)),
@@ -760,25 +828,27 @@ class Tracker:
             ("➖\nMinimize", self._then_close(lambda: window_cmd("min"))),
             ("✖\nClose window", self._then_close(lambda: window_cmd("close"))),
             ("🔉\nVolume −", lambda: pyautogui.press("volumedown", presses=5)),  # stays open: tap again
-            ("🔊\nVolume +", lambda: pyautogui.press("volumeup", presses=5)),
-            ("⏯\nPlay / Pause", lambda: pyautogui.press("playpause"))], "")
+            ("🔊\nVolume +", lambda: pyautogui.press("volumeup", presses=5))], "")
         return panel(boxes=[(0.1, 0.07, 0.9, y)], texts=texts, buttons=buttons)
 
     def _pad(self):
         L, R, T, B = 0.2, 0.8, 0.21, 0.62
-        texts = [("🔍 SEARCH APPS" if self.search else "✍ WRITING PAD", L, 0.105, 20, "cyan", "w"),
+        title = "✨ ASK AI" if self.ai else "🔍 SEARCH APPS" if self.search else "✍ WRITING PAD"
+        prompt = (f"✨  {self.query}▏" if self.ai else f"🔍  {self.query}▏" if self.search
+                  else "typed:  " + "".join(self.chunks)[-44:])
+        texts = [(title, L, 0.105, 20, "cyan", "w"),
                  ("pinch and write in the box · pause and it turns into text", R, 0.105, 12, "dim", "e"),
-                 (f"🔍  {self.query}▏" if self.search else "typed:  " + "".join(self.chunks)[-44:],
-                  L, 0.165, 16, "white", "w")]
+                 (prompt, L, 0.165, 16, "white", "w")]
         buttons = []
-        if self.recognizing:
-            texts.append(("reading your handwriting…", R, 0.165, 13, "green", "e"))
+        if self.recognizing or self.ai_busy:
+            texts.append(("thinking…" if self.ai_busy else "reading your handwriting…", R, 0.165, 13, "green", "e"))
         elif self.alts:  # "did you mean" chips: tap one to swap the last word
             for i, a in enumerate(reversed(self.alts)):
                 buttons.append(btn(f"alt{i}", a, R - (i + 1) * 0.095 + 0.003, 0.145, R - i * 0.095 - 0.003,
                                    0.188, lambda a=a: self._use_alt(a), 13))
         keys = [("⌫", self._backspace), ("⌫ word", self._delete_word), ("␣ space", self._space),
-                ("↵ enter", self._enter), ("clear ink", self._clear_ink), ("✕ close", lambda: self.set_mode(None))]
+                ("↵ ask AI" if self.ai else "↵ enter", self._enter), ("clear ink", self._clear_ink),
+                ("✕ close", lambda: self.set_mode(None))]
         kw = (R - L) / len(keys)
         buttons += [btn(f"pad{i}", label, L + i * kw + 0.003, B + 0.015, L + (i + 1) * kw - 0.003, B + 0.085, fn, 16)
                     for i, (label, fn) in enumerate(keys)]
@@ -792,6 +862,13 @@ class Tracker:
                             bottom + 0.13, lambda n=n, a=a: self._launch(n, a), 13)
                         for i, (n, a) in enumerate(results)]
             bottom += 0.145
+        elif self.ai:
+            hint = self.ai_reply or "write a command ('open spotify', 'screenshot') or question, then tap ↵ ask AI"
+            texts.append((hint[:88], L, bottom + 0.03, 13, "cyan" if self.ai_reply else "dim", "w"))
+            if self.ai_reply:
+                buttons.append(btn("ai_type", "⌨ type reply", R - 0.14, bottom + 0.01, R, bottom + 0.06,
+                                   self._type_ai, 13))
+            bottom += 0.075
         return panel(boxes=[(L - 0.02, 0.07, R + 0.02, bottom)], texts=texts, buttons=buttons, pad=(L, T, R, B))
 
 
@@ -1179,14 +1256,20 @@ def selftest():
     assert [n for n, _ in search_apps(apps, "spot")] == ["Spotify"]  # no loose junk like PostgreSQL
     assert window_label("Instagram - Google Chrome") == "Google Chrome\nInstagram"
     assert window_label("Wikipédia — Mozilla Firefox") == "Mozilla Firefox\nWikipédia"
+    assert ai_intent("open spotlfy", apps) == ("app", ("Spotify", "a"))
+    assert ai_intent("ouvre parametres", apps) == ("app", ("Paramètres", "g"))
+    assert ai_intent("take a screenshot", apps) == ("key", ("win", "shift", "s"))
+    assert ai_intent("close window", apps) == ("win", "close")
+    assert ai_intent("what is the speed of light", apps) is None
 
     t = Tracker(None, {}, start=False)  # every panel lays out, every tile fits on screen
     t.apps = apps
-    for mode, search in (("launcher", False), ("pad", False), ("pad", True), ("keyboard", False)):
-        t.set_mode(mode, search)
-        t.query = "spot"
+    for mode, search, ai in (("launcher", False, False), ("pad", False, False), ("pad", True, False),
+                             ("pad", False, True), ("keyboard", False, False)):
+        t.set_mode(mode, search, ai)
+        t.query, t.ai_reply = "spot", "42"
         ui = t._layout()
-        assert ui.buttons and all(0 <= v <= 1 for b in ui.buttons for v in b.r), mode
+        assert ui.buttons and all(0 <= v <= 1 for b in ui.buttons for v in b.r), (mode, search, ai)
     real = pyautogui.position, pyautogui.mouseDown, pyautogui.doubleClick
     calls = []
     pyautogui.position = lambda: (500, 500)

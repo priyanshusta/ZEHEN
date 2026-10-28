@@ -471,26 +471,29 @@ FOLDERS = {"desktop": "shell:Desktop", "downloads": "shell:Downloads", "document
            "pictures": "shell:My Pictures", "music": "shell:My Music", "videos": "shell:My Video"}
 MAX_STEPS = 6
 _local, _local_lock, _tts, _local_used = None, threading.Lock(), None, 0.0
+_stt_lock, _tts_lock = threading.Lock(), threading.Lock()
 
 
 def fetch(url, dest, unzip=False, progress=lambda done, size: None):
     """Download once into ~/.zehen. Refuses up front when the disk can't hold it."""
     DATA.mkdir(exist_ok=True)
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "ZEHEN"}), timeout=30) as r:
-        size, free = int(r.headers.get("Content-Length", 0)), shutil.disk_usage(DATA).free
-        if free < size + 5e8:
-            raise RuntimeError(f"Needs {(size + 5e8) / 1e9:.1f} GB free on this drive, you have {free / 1e9:.1f} GB")
-        part = dest.with_suffix(".part")
-        with open(part, "wb") as f:
-            while chunk := r.read(1 << 20):
-                f.write(chunk)
-                progress(f.tell(), size)
-    if unzip:
-        with zipfile.ZipFile(part) as z:
-            z.extractall(DATA)
-        part.unlink()
-    else:
-        part.replace(dest)
+    part = dest.with_suffix(f".{threading.get_ident()}.part")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "ZEHEN"}), timeout=30) as r:
+            size, free = int(r.headers.get("Content-Length", 0)), shutil.disk_usage(DATA).free
+            if free < size + 5e8:
+                raise RuntimeError(f"Needs {(size + 5e8) / 1e9:.1f} GB free on this drive, you have {free / 1e9:.1f} GB")
+            with open(part, "wb") as f:
+                while chunk := r.read(1 << 20):
+                    f.write(chunk)
+                    progress(f.tell(), size)
+        if unzip:
+            with zipfile.ZipFile(part) as z:
+                z.extractall(DATA)
+        else:
+            part.replace(dest)
+    finally:
+        part.unlink(missing_ok=True)
 
 
 def _unload_when_idle():
@@ -551,27 +554,28 @@ def stt_engine(cfg, note=lambda s, frac=None: None):
     """Whisper through faster-whisper, int8 on the CPU: about 0.4 s for a spoken command, 145 MB, downloaded once.
     It copes with accents, spells names properly and is told your app and window names, so "Jupyter" stays Jupyter."""
     global _stt, _stt_used
-    _stt_used = time.monotonic()
-    if _stt is None:
-        name = cfg.get("stt_model", "base.en")  # tiny.en is quicker, small.en is sharper (480 MB)
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            if getattr(sys, "frozen", False):
-                raise RuntimeError("Speech recognition needs the Python install, not the .exe")
-            note("Installing speech recognition…")
-            if subprocess.run([sys.executable, "-m", "pip", "install", "faster-whisper"], capture_output=True,
-                              creationflags=0x08000000).returncode:
-                raise RuntimeError("Couldn't install speech recognition")
-            from faster_whisper import WhisperModel
-        folder = DATA / ("whisper-" + name)
-        folder.mkdir(parents=True, exist_ok=True)
-        for f in WHISPER_FILES:
-            if not (folder / f).exists():
-                fetch(WHISPER_URL % name + f, folder / f, progress=lambda d, n: note(
-                    f"Downloading hearing {d / 1e6:.0f}/{n / 1e6:.0f} MB", d / n if n else None))
-        _stt = WhisperModel(str(folder), device="cpu", compute_type="int8", cpu_threads=min(4, os.cpu_count() or 2))
-    return _stt
+    with _stt_lock:
+        _stt_used = time.monotonic()
+        if _stt is None:
+            name = cfg.get("stt_model", "base.en")  # tiny.en is quicker, small.en is sharper (480 MB)
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError:
+                if getattr(sys, "frozen", False):
+                    raise RuntimeError("Speech recognition needs the Python install, not the .exe")
+                note("Installing speech recognition…")
+                if subprocess.run([sys.executable, "-m", "pip", "install", "faster-whisper"], capture_output=True,
+                                  creationflags=0x08000000).returncode:
+                    raise RuntimeError("Couldn't install speech recognition")
+                from faster_whisper import WhisperModel
+            folder = DATA / ("whisper-" + name)
+            folder.mkdir(parents=True, exist_ok=True)
+            for f in WHISPER_FILES:
+                if not (folder / f).exists():
+                    fetch(WHISPER_URL % name + f, folder / f, progress=lambda d, n: note(
+                        f"Downloading hearing {d / 1e6:.0f}/{n / 1e6:.0f} MB", d / n if n else None))
+            _stt = WhisperModel(str(folder), device="cpu", compute_type="int8", cpu_threads=min(4, os.cpu_count() or 2))
+        return _stt
 
 
 def sane_transcript(text, hints=(), other=""):
@@ -617,26 +621,33 @@ def memory_keeper():
     while True:
         time.sleep(20)
         now = time.monotonic()
-        if _tts is not None and now - _tts_used > 120:
-            _tts = None
-            gc.collect()
-        if _stt is not None and now - _stt_used > 120:
-            _stt = None
-            gc.collect()
+        if _tts is not None and now - _tts_used > 120 and _tts_lock.acquire(blocking=False):
+            try:
+                _tts = None
+                gc.collect()
+            finally:
+                _tts_lock.release()
+        if _stt is not None and now - _stt_used > 120 and _stt_lock.acquire(blocking=False):
+            try:
+                _stt = None
+                gc.collect()
+            finally:
+                _stt_lock.release()
         if now - max(_tts_used, _stt_used, _local_used) > 60:
             trim_memory()
 
 
 def tts_engine():
     global _tts, _tts_used
-    _tts_used = time.monotonic()
-    if _tts is None:
-        from kokoro_onnx import Kokoro
-        for name in KOKORO_FILES:
-            if not (DATA / name).exists():
-                fetch(KOKORO_URL + name, DATA / name)
-        _tts = Kokoro(str(DATA / KOKORO_FILES[0]), str(DATA / KOKORO_FILES[1]))
-    return _tts
+    with _tts_lock:
+        _tts_used = time.monotonic()
+        if _tts is None:
+            from kokoro_onnx import Kokoro
+            for name in KOKORO_FILES:
+                if not (DATA / name).exists():
+                    fetch(KOKORO_URL + name, DATA / name)
+            _tts = Kokoro(str(DATA / KOKORO_FILES[0]), str(DATA / KOKORO_FILES[1]))
+        return _tts
 
 
 NAMES = {"noor": "नूर", "zehen": "ज़ेहेन"}  # an English voice reads "Noor" as "nor": say them from Hindi spelling instead
@@ -702,16 +713,18 @@ def parse_plan(text):
     """Model reply -> (say, actions, done). Only known actions with plain string values survive. Small models
     wrap JSON in <think> tags or write {"open_app", "x"} for {"open_app": "x"}: both are repaired, and raw model
     text is never shown or spoken."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.S).strip()
     if "{" not in text:
         return text[:200], [], True  # it just talked: that is the answer
     try:
         plan = json.loads(text[text.index("{"):text.rindex("}") + 1])
-        acts = [a for a in plan.get("do", []) if isinstance(a, dict) and len(a) == 1]
+        do = plan.get("do", [])
+        do = [do] if isinstance(do, dict) else do if isinstance(do, list) else []
+        acts = [a for a in do if isinstance(a, dict) and len(a) == 1]
         say, done = str(plan.get("say", "")), plan.get("done", True) is not False
     except (ValueError, AttributeError, TypeError):
         m = re.search(r'"say"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-        say = m[1] if m else ""
+        say = m[1].replace('\\"', '"').replace("\\n", " ") if m else ""
         acts = [{k: v} for k, v in re.findall(r'\{\s*"(\w+)"\s*[:,]\s*"((?:[^"\\]|\\.)*)"\s*\}', text) if k != "say"]
         done = not re.search(r'"done"\s*:\s*false', text)
         if not say and not acts:
@@ -933,22 +946,35 @@ UI_KINDS = {"ButtonControl": "button", "EditControl": "text box", "ListItemContr
             "ComboBoxControl": "dropdown", "TreeItemControl": "item", "RadioButtonControl": "option"}
 
 
+def _uia_top(auto, top=None):
+    if top is not None:
+        return top
+    try:
+        c = auto.GetForegroundControl()
+        return c.GetTopLevelControl() if c else None
+    except Exception:
+        return None
+
+
 def ui_controls(limit=400, top=None):
     """Clickable things in the window in front, read through Windows UI Automation (no screenshots, no vision
     model, almost no RAM): [(kind, name, control)]. Works with any app that exposes accessibility, which is
     nearly all of them, Electron and browsers included."""
     import uiautomation as auto
-    if top is None:
-        top = auto.GetForegroundControl()
-        top = top.GetTopLevelControl() if top else None
     out, t0 = [], time.monotonic()
-    for c, _ in auto.WalkControl(top, maxDepth=45) if top else []:  # web pages sit 25+ levels deep
-        if time.monotonic() - t0 > 4:
-            break  # a huge page: work with what we have
-        if c.ControlTypeName in UI_KINDS and c.Name.strip() and not c.IsOffscreen:
-            out.append((UI_KINDS[c.ControlTypeName], c.Name.strip().replace("\n", " "), c))
-        if len(out) >= limit:
-            break
+    try:
+        with auto.UIAutomationInitializerInThread():
+            top = _uia_top(auto, top)
+            for c, _ in auto.WalkControl(top, maxDepth=45) if top else []:  # web pages sit 25+ levels deep
+                if time.monotonic() - t0 > 4 or len(out) >= limit:
+                    break  # a huge page: work with what we have
+                try:
+                    if c.ControlTypeName in UI_KINDS and (name := c.Name.strip()) and not c.IsOffscreen:
+                        out.append((UI_KINDS[c.ControlTypeName], name.replace("\n", " "), c))
+                except Exception:
+                    continue
+    except Exception:
+        pass
     return out
 
 
@@ -979,11 +1005,19 @@ def best_match(query, names, need=0.6):
 def ui_tabs(top=None):
     """The tabs of the browser (or any tabbed app) in front: [(title, control)]."""
     import uiautomation as auto
-    if top is None:
-        top = auto.GetForegroundControl()
-        top = top.GetTopLevelControl() if top else None
-    return [(c.Name.strip(), c) for c, _ in (auto.WalkControl(top, maxDepth=12) if top else [])
-            if c.ControlTypeName == "TabItemControl" and c.Name.strip() and not c.IsOffscreen]
+    out = []
+    try:
+        with auto.UIAutomationInitializerInThread():
+            top = _uia_top(auto, top)
+            for c, _ in (auto.WalkControl(top, maxDepth=12) if top else []):
+                try:
+                    if c.ControlTypeName == "TabItemControl" and (name := c.Name.strip()) and not c.IsOffscreen:
+                        out.append((name, c))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
 
 
 def switch_tab(query, top=None):
@@ -1032,19 +1066,24 @@ def video_links(top=None):
     """Videos on the page in front, in reading order: YouTube and most video sites name a video's link with its title and
     length ("... 7 minutes, 6 seconds"). Ads are skipped."""
     import uiautomation as auto
-    if top is None:
-        top = auto.GetForegroundControl()
-        top = top.GetTopLevelControl() if top else None
     found, t0 = [], time.monotonic()
-    for c, _ in auto.WalkControl(top, maxDepth=60) if top else []:
-        if time.monotonic() - t0 > 5:
-            break
-        if c.ControlTypeName == "HyperlinkControl":
-            n = c.Name.strip()
-            if re.search(r"\b\d+\s+(?:second|minute|hour)s?\b", n) and not re.search(r"sponsored|\bad\b", n, re.I) \
-                    and not c.IsOffscreen and c.BoundingRectangle.width() >= 120:
-                r = c.BoundingRectangle
-                found.append((r.top // 40, r.left, n, c))  # rows of 40 px, then left to right
+    try:
+        with auto.UIAutomationInitializerInThread():
+            top = _uia_top(auto, top)
+            for c, _ in auto.WalkControl(top, maxDepth=60) if top else []:
+                if time.monotonic() - t0 > 5:
+                    break
+                try:
+                    if c.ControlTypeName == "HyperlinkControl":
+                        n = c.Name.strip()
+                        if re.search(r"\b\d+\s+(?:second|minute|hour)s?\b", n) and not re.search(r"sponsored|\bad\b", n, re.I) \
+                                and not c.IsOffscreen and c.BoundingRectangle.width() >= 120:
+                            r = c.BoundingRectangle
+                            found.append((r.top // 40, r.left, n, c))  # rows of 40 px, then left to right
+                except Exception:
+                    continue
+    except Exception:
+        pass
     found.sort(key=lambda f: (f[0], f[1]))
     return [(n, c) for _, _, n, c in found]
 
@@ -1128,23 +1167,25 @@ def mfcc(pcm):
     x = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
     if len(x) < 1200:
         return None
-    x = np.append(x[0], x[1:] - 0.97 * x[:-1])  # pre-emphasis
+    x = np.append(x[0], x[1:] - np.float32(0.97) * x[:-1])  # pre-emphasis
     frames = 1 + (len(x) - 400) // 160
-    fr = x[np.arange(400)[None, :] + 160 * np.arange(frames)[:, None]] * np.hamming(400)
-    power = np.abs(np.fft.rfft(fr, 512)) ** 2
     if _MEL is None:  # 26 mel filters from 80 Hz to 7.6 kHz, and the DCT that turns them into cepstra
         mel = lambda f: 2595 * np.log10(1 + f / 700)
         pts = 700 * (10 ** (np.linspace(mel(80), mel(7600), 28) / 2595) - 1)
         bins = np.floor((512 + 1) * pts / 16000).astype(int)
-        fb = np.zeros((26, 257))
+        fb = np.zeros((26, 257), dtype=np.float32)
         for m in range(26):
             l, c, r = bins[m], bins[m + 1], bins[m + 2]
             fb[m, l:c] = (np.arange(l, c) - l) / max(c - l, 1)
             fb[m, c:r] = (r - np.arange(c, r)) / max(r - c, 1)
-        dct = np.cos(np.pi / 26 * (np.arange(26) + .5)[None, :] * np.arange(1, 13)[:, None])
-        _MEL = (fb, dct)
-    c = np.log(power @ _MEL[0].T + 1e-10) @ _MEL[1].T
-    return c - c.mean(0)
+        dct = np.cos(np.pi / 26 * (np.arange(26) + .5)[None, :] * np.arange(1, 13)[:, None]).astype(np.float32)
+        _MEL = (fb, dct, np.hamming(400).astype(np.float32))
+    fr = x[np.arange(400)[None, :] + 160 * np.arange(frames)[:, None]] * _MEL[2]
+    power = np.abs(np.fft.rfft(fr, 512)) ** 2
+    c = np.log(power @ _MEL[0].T + np.float32(1e-10)) @ _MEL[1].T
+    energy = power.sum(1)
+    voiced = energy > np.percentile(energy, 25)
+    return c - (c[voiced].mean(0) if voiced.any() else c.mean(0))
 
 
 def dtw(template, audio):
@@ -1152,19 +1193,26 @@ def dtw(template, audio):
     end, so a word spoken fast or slow still lines up. Returns (score, end frame); lower is closer."""
     import numpy as np
     T, N = len(template), len(audio)
-    cost = np.sqrt(((template[:, None, :] - audio[None, :, :]) ** 2).sum(-1))
-    D = np.full((T, N), np.inf)
-    D[0, :min(N, 30)] = cost[0, :min(N, 30)]
-    for i in range(T):
-        for j in range(N):
-            if i == 0 and j < 30:
-                continue
-            best = min(D[i - 1, j] if i else np.inf, D[i, j - 1] if j else np.inf,
-                       D[i - 1, j - 1] if i and j else np.inf)
-            D[i, j] = cost[i, j] + best
-    last = D[T - 1, int(T * .6):]
-    j = int(last.argmin())
-    return float(last[j] / T), int(T * .6) + j
+    if not T or not N:
+        return float("inf"), 0
+    cost = np.linalg.norm(template[:, None, :] - audio[None, :, :], axis=-1).astype(np.float32)
+    D = np.full((T, N), np.inf, dtype=np.float32)
+    free = min(N, 30)
+    D[0, :free] = cost[0, :free]
+    for j in range(free, N):
+        D[0, j] = cost[0, j] + D[0, j - 1]
+    for i in range(1, T):
+        prev, row = D[i - 1], cost[i]
+        cur = np.empty(N, dtype=np.float32)
+        cur[0] = row[0] + prev[0]
+        cur[1:] = row[1:] + np.minimum(prev[:-1], prev[1:])
+        for j in range(1, N):
+            if cur[j - 1] + row[j] < cur[j]:
+                cur[j] = cur[j - 1] + row[j]
+        D[i] = cur
+    start = min(int(T * .6), N - 1)
+    j = int(D[T - 1, start:].argmin())
+    return float(D[T - 1, start + j] / T), start + j
 
 
 class Voice:
@@ -2971,13 +3019,13 @@ class HUD:
 
 def load_config():
     try:
-        return json.loads(CONFIG.read_text())
+        return json.loads(CONFIG.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
 
 def save_config(cfg):
-    CONFIG.write_text(json.dumps(cfg))
+    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
 
 
 def open_camera(index):
@@ -3317,6 +3365,9 @@ def selftest():
     tone = lambda f0, f1: (np.sin(np.cumsum(np.linspace(f0, f1, 9600)) * 2 * np.pi / 16000) * 12000).astype(np.int16).tobytes()
     a1, a2, b1 = mfcc(tone(300, 900)), mfcc(tone(310, 880)), mfcc(tone(1500, 400))
     assert dtw(a1, a2)[0] < dtw(a1, b1)[0] * 0.6  # the same sweep matches itself far better than a different one
+    assert dtw(a1, a2[:10])[1] < 10  # short audio buffer (< 0.6 * T) must not raise ValueError on argmin
+    assert parse_plan('<think>unclosed reasoning {"open_app": "Spotify"}')[1] == []
+    assert parse_plan('{"say": "Opened Spotify.", "do": {"open_app": "Spotify"}}')[1] == [{"open_app": "Spotify"}]
     sent2 = []
     real_io = pyautogui.scroll, pyautogui.click, pyautogui.press
     pyautogui.scroll, pyautogui.click, pyautogui.press = (lambda n: sent2.append(("scroll", n)),

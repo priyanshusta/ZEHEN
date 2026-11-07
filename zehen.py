@@ -217,6 +217,8 @@ def beautify(points, aspect=16 / 9):
     if not total:
         return points[:1]
     P = unhook(unhook(P)[::-1])[::-1]  # both ends
+    if len(P) < 2:
+        return back(P) if P else points[:1]
     mean = lambda pts: (sum(q[0] for q in pts) / len(pts), sum(q[1] for q in pts) / len(pts))
     P = [P[0]] + [mean(P[max(0, n - 2):n + 3]) for n in range(1, len(P) - 1)] + [P[-1]]  # tremor
     for _ in range(2):  # Chaikin corner cutting: rounds what's left of the jitter into a curve
@@ -278,7 +280,7 @@ def open_folder(path=Path.home()):
 
 if sys.platform == "win32":
     from ctypes import wintypes
-    u32, dwm = ctypes.WinDLL("user32"), ctypes.WinDLL("dwmapi")  # own handles: argtypes here don't leak elsewhere
+    u32, dwm, k32 = ctypes.WinDLL("user32"), ctypes.WinDLL("dwmapi"), ctypes.WinDLL("kernel32")
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     for name, args in (("EnumWindows", [WNDENUMPROC, wintypes.LPARAM]), ("IsWindowVisible", [wintypes.HWND]),
                        ("GetWindow", [wintypes.HWND, wintypes.UINT]), ("GetWindowTextLengthW", [wintypes.HWND]),
@@ -287,10 +289,47 @@ if sys.platform == "win32":
                        ("GetWindowLongW", [wintypes.HWND, ctypes.c_int]), ("IsIconic", [wintypes.HWND]),
                        ("ShowWindow", [wintypes.HWND, ctypes.c_int]),
                        ("SwitchToThisWindow", [wintypes.HWND, wintypes.BOOL]),
-                       ("PostMessageW", [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM])):
+                       ("PostMessageW", [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]),
+                       ("OpenClipboard", [wintypes.HWND]), ("CloseClipboard", []),
+                       ("GetClipboardData", [wintypes.UINT])):
         getattr(u32, name).argtypes = args
     u32.GetWindow.restype = u32.GetForegroundWindow.restype = wintypes.HWND
+    u32.GetClipboardData.restype = wintypes.HANDLE
+    k32.GlobalLock.argtypes, k32.GlobalLock.restype = [wintypes.HGLOBAL], ctypes.c_void_p
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
     dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t), ("_pad", ctypes.c_ubyte * 8)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("ki", _KEYBDINPUT)]
+
+    u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+
+
+def unicode_events(text):
+    """UTF-16LE (scan, flags) pairs for Win32 SendInput(KEYEVENTF_UNICODE): zero clipboard clobbering."""
+    raw = text.encode("utf-16-le")
+    units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    return [(u, f) for u in units for f in (0x0004, 0x0006)]  # KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+
+
+def type_text(text):
+    """Type text into the active window. Win32 SendInput avoids clipboard overwrites and process lag."""
+    if sys.platform == "win32":
+        events = unicode_events(text)
+        if not events:
+            return
+        inputs = (_INPUT * len(events))()
+        for i, (u, flags) in enumerate(events):
+            inputs[i].type = 1  # INPUT_KEYBOARD
+            inputs[i].ki.wScan = u
+            inputs[i].ki.dwFlags = flags
+        u32.SendInput(len(inputs), inputs, ctypes.sizeof(_INPUT))
+    else:
+        pyautogui.write(text, interval=0.015)
 
 
 def window_text(h, fn="GetWindowTextW"):
@@ -353,7 +392,8 @@ def installed_apps():
                          timeout=60, creationflags=0x08000000).stdout  # CREATE_NO_WINDOW: no console flash
     apps = json.loads(out or "[]")
     apps = [apps] if isinstance(apps, dict) else apps
-    return [(a["Name"].strip(), a["AppID"]) for a in apps if not a["AppID"].startswith("http")]  # skip web links
+    return [(a["Name"].strip(), a["AppID"]) for a in apps
+            if isinstance(a, dict) and a.get("Name") and a.get("AppID") and not a["AppID"].startswith("http")]
 
 
 def launch(app_id):
@@ -1587,6 +1627,21 @@ class Voice:
 
 
 def clipboard_text():
+    """Read text from the clipboard. Uses native Win32 APIs when available to avoid PowerShell process lag."""
+    if sys.platform == "win32":
+        if u32.OpenClipboard(None):
+            try:
+                h = u32.GetClipboardData(13)  # CF_UNICODETEXT
+                if h:
+                    ptr = k32.GlobalLock(h)
+                    if ptr:
+                        try:
+                            return ctypes.wstring_at(ptr).strip()
+                        finally:
+                            k32.GlobalUnlock(h)
+            finally:
+                u32.CloseClipboard()
+        return ""
     ps = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw"
     return subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, encoding="utf-8",
                           timeout=10, creationflags=0x08000000).stdout.strip()
@@ -1941,6 +1996,11 @@ class Tracker:
                 self._publish(now, [lm] + ([lm2] if lm2 is not None else []), (nx, ny), ptr2, progress,
                               gesture, since, zoom)
         finally:
+            if det is not None:
+                try:
+                    det.close()
+                except Exception:
+                    pass
             if self.cam is not None:
                 self.cam.release()
 
@@ -2032,13 +2092,10 @@ class Tracker:
             self._type(gap + best)
 
     def _type(self, text):
-        if text.isascii():
-            # a small gap per key: at full speed Notepad dropped letters ("look ma" arrived as "look a")
+        if sys.platform == "win32" and not text.isascii():
+            type_text(text)
+        else:
             pyautogui.write(text, interval=0.015)
-        else:  # Hindi, accents, emoji: paste it, since keys can't type them
-            subprocess.run(["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value $env:ZEHEN_SAY"],
-                           env={**os.environ, "ZEHEN_SAY": text}, creationflags=0x08000000)
-            pyautogui.hotkey("ctrl", "v")
         self.chunks.append(text)
 
     def _use_alt(self, alt):
@@ -2258,14 +2315,19 @@ class Tracker:
                 return "opened " + m[0][0]
             return f"no app like '{v}'"
         elif kind == "focus_window":
-            if m := next((h for h, t in list_windows() if fold(v) in fold(t)), None):
+            wins = list_windows()
+            if m := next((h for h, t in wins if fold(v) in fold(t)), None):
                 focus_window(m)
                 return "switched to " + v
+            if (idx := best_match(v, [t for _, t in wins])) is not None:
+                focus_window(wins[idx][0])
+                return "switched to " + wins[idx][1][:40]
             return f"no window like '{v}'"
         elif kind == "open_url":
-            if v.startswith(("http://", "https://")):
-                webbrowser.open(v)
-                return "opened " + urllib.parse.urlparse(v).netloc
+            target = v if v.startswith(("http://", "https://")) else f"https://{v}" if "." in v else None
+            if target:
+                webbrowser.open(target)
+                return "opened " + urllib.parse.urlparse(target).netloc
             return f"no link like '{v}'"
         elif kind == "search_web":
             webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote(v))
@@ -2275,20 +2337,32 @@ class Tracker:
             keys = [k.strip().lower() for k in v.split("+")]
             if all(k in pyautogui.KEYBOARD_KEYS for k in keys):
                 pyautogui.hotkey(*keys)
-        elif kind == "window" and v in ("max", "min", "close"):
-            window_cmd(v)
-        elif kind == "volume" and v in ("up", "down"):
-            pyautogui.press("volume" + v, presses=5)
+        elif kind == "window":
+            cmd = {"maximize": "max", "minimize": "min", "close window": "close"}.get(v.lower().strip(), v.lower().strip())
+            if cmd in ("max", "min", "close"):
+                window_cmd(cmd)
+        elif kind == "volume":
+            v_low = v.lower().strip()
+            if v_low in ("mute", "unmute"):
+                pyautogui.press("volumemute")
+            elif "up" in v_low or "down" in v_low:
+                digits = re.search(r"\d+", v_low)
+                presses = int(digits[0]) if digits else 5
+                pyautogui.press("volumeup" if "up" in v_low else "volumedown", presses=presses)
         elif kind == "media" and v in ("playpause", "nexttrack", "prevtrack"):
             pyautogui.press(v)
         elif kind == "powershell":
             return run_powershell(v)
         elif kind == "scroll":
-            d, _, n = v.partition(" ")
+            parts = v.strip().lower().split()
+            d = parts[0] if parts else "down"
             if d in ("top", "bottom"):
                 pyautogui.press("home" if d == "top" else "end")
             elif d in ("up", "down"):
-                pyautogui.scroll((1 if d == "up" else -1) * int(n or 6) * (120 if sys.platform == "win32" else 1))
+                amt_str = " ".join(parts[1:])
+                digits = re.search(r"\d+", amt_str)
+                amt = int(digits[0]) if digits else {"a lot": 15, "fast": 15, "more": 10, "a bit": 3, "a little": 3}.get(amt_str, 6)
+                pyautogui.scroll((1 if d == "up" else -1) * amt * (120 if sys.platform == "win32" else 1))
         elif kind == "mouse":
             {"click": pyautogui.click, "double": pyautogui.doubleClick, "right": pyautogui.rightClick}.get(
                 v, lambda: None)()
@@ -2308,7 +2382,8 @@ class Tracker:
         elif kind == "open_folder" and v in FOLDERS:
             os.startfile(FOLDERS[v])
         elif kind == "wait":
-            time.sleep(min(float(v) if v.replace(".", "", 1).isdigit() else 1.0, 5.0))
+            m = re.search(r"\d+(?:\.\d+)?", v)
+            time.sleep(min(float(m[0]) if m else 1.0, 5.0))
         elif kind == "ui_list":
             return ui_list()
         elif kind == "click":
@@ -3017,6 +3092,9 @@ class HUD:
         return y + px(8)
 
 
+_cfg_lock = threading.Lock()
+
+
 def load_config():
     try:
         return json.loads(CONFIG.read_text(encoding="utf-8"))
@@ -3025,7 +3103,10 @@ def load_config():
 
 
 def save_config(cfg):
-    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    with _cfg_lock:
+        tmp = CONFIG.with_suffix(f".{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CONFIG)
 
 
 def open_camera(index):
@@ -3368,16 +3449,22 @@ def selftest():
     assert dtw(a1, a2[:10])[1] < 10  # short audio buffer (< 0.6 * T) must not raise ValueError on argmin
     assert parse_plan('<think>unclosed reasoning {"open_app": "Spotify"}')[1] == []
     assert parse_plan('{"say": "Opened Spotify.", "do": {"open_app": "Spotify"}}')[1] == [{"open_app": "Spotify"}]
+    assert unicode_events("é") == [(0x00E9, 0x0004), (0x00E9, 0x0006)]
+    if sys.platform == "win32":
+        assert ctypes.sizeof(_INPUT) == (40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28)
+        assert isinstance(clipboard_text(), str)
     sent2 = []
     real_io = pyautogui.scroll, pyautogui.click, pyautogui.press
     pyautogui.scroll, pyautogui.click, pyautogui.press = (lambda n: sent2.append(("scroll", n)),
                                                             lambda: sent2.append("click"),
                                                             lambda k, **kw: sent2.append(("press", k)))
-    for kind, v in (("scroll", "down 6"), ("scroll", "up"), ("scroll", "bottom"), ("mouse", "click"), ("mouse", "bogus")):
+    for kind, v in (("scroll", "down 6"), ("scroll", "up"), ("scroll", "bottom"), ("scroll", "down a lot"),
+                    ("volume", "mute"), ("mouse", "click"), ("mouse", "bogus")):
         t._do(kind, v)
     pyautogui.scroll, pyautogui.click, pyautogui.press = real_io
     k = 120 if sys.platform == "win32" else 1
-    assert sent2 == [("scroll", -6 * k), ("scroll", 6 * k), ("press", "end"), "click"], sent2
+    assert sent2 == [("scroll", -6 * k), ("scroll", 6 * k), ("press", "end"), ("scroll", -15 * k),
+                     ("press", "volumemute"), "click"], sent2
     for mode, search in (("launcher", False), ("pad", False), ("pad", True), ("keyboard", False)):
         t.set_mode(mode, search)
         t.query = "spot"

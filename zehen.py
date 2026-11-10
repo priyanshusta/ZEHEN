@@ -9,11 +9,13 @@ Settings: %USERPROFILE%\.zehen.json  ("main_hand": "Left" for left-handers, "app
 Voice:    say "Zehen, open Spotify". Free cloud key (faster): panel > Get key > Paste key, or env ZEHEN_API_KEY.
           No key: a small offline model downloads on first use (needs ~1.6 GB free disk). "voice": false turns it off
 """
+import ast
 import ctypes
 import difflib
 import io
 import json
 import math
+import operator
 import os
 import random
 import re
@@ -291,10 +293,12 @@ if sys.platform == "win32":
                        ("SwitchToThisWindow", [wintypes.HWND, wintypes.BOOL]),
                        ("PostMessageW", [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]),
                        ("OpenClipboard", [wintypes.HWND]), ("CloseClipboard", []),
+                       ("EmptyClipboard", []),
                        ("GetClipboardData", [wintypes.UINT])):
         getattr(u32, name).argtypes = args
     u32.GetWindow.restype = u32.GetForegroundWindow.restype = wintypes.HWND
     u32.GetClipboardData.restype = wintypes.HANDLE
+    u32.EmptyClipboard.restype = wintypes.BOOL
     k32.GlobalLock.argtypes, k32.GlobalLock.restype = [wintypes.HGLOBAL], ctypes.c_void_p
     k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
     dwm.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
@@ -307,6 +311,21 @@ if sys.platform == "win32":
         _fields_ = [("type", wintypes.DWORD), ("ki", _KEYBDINPUT)]
 
     u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+
+    class SYSTEM_POWER_STATUS(ctypes.Structure):
+        _fields_ = [("ACLineStatus", ctypes.c_byte), ("BatteryFlag", ctypes.c_byte),
+                    ("BatteryLifePercent", ctypes.c_byte), ("SystemStatusFlag", ctypes.c_byte),
+                    ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+    k32.GetSystemPowerStatus.argtypes = [ctypes.POINTER(SYSTEM_POWER_STATUS)]
+    k32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
 
 
 def unicode_events(text):
@@ -330,6 +349,126 @@ def type_text(text):
         u32.SendInput(len(inputs), inputs, ctypes.sizeof(_INPUT))
     else:
         pyautogui.write(text, interval=0.015)
+
+
+def system_battery():
+    """Polite status of the battery (percentage, charging state) via Win32 GetSystemPowerStatus."""
+    if sys.platform == "win32":
+        try:
+            sps = SYSTEM_POWER_STATUS()
+            if k32.GetSystemPowerStatus(ctypes.byref(sps)):
+                pct = sps.BatteryLifePercent
+                if pct != 255:
+                    state = "plugged in and charging" if sps.ACLineStatus == 1 else "discharging"
+                    return f"Battery is at {pct}%, {state}."
+        except Exception:
+            pass
+    return "No battery status available."
+
+
+def system_memory():
+    """Instant Win32 RAM usage report via GlobalMemoryStatusEx."""
+    if sys.platform == "win32":
+        try:
+            mem = MEMORYSTATUSEX()
+            mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if k32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+                total_gb = mem.ullTotalPhys / (1024 ** 3)
+                avail_gb = mem.ullAvailPhys / (1024 ** 3)
+                return f"Memory usage is at {mem.dwMemoryLoad}%. {avail_gb:.1f} GB of {total_gb:.1f} GB available."
+        except Exception:
+            pass
+    return "Memory information is not available."
+
+
+def active_window_title():
+    """Title of the window currently in front."""
+    if sys.platform == "win32":
+        h = u32.GetForegroundWindow()
+        if h and (t := window_text(h)):
+            return f"You are looking at {t[:50]}."
+    return "No front window detected."
+
+
+def clipboard_preview():
+    """Spoken preview of the clipboard text."""
+    txt = clipboard_text()
+    if not txt or not txt.strip():
+        return "Your clipboard is empty."
+    clean = " ".join(txt.strip().split())
+    if len(clean) > 100:
+        clean = clean[:97] + "..."
+    return f"Your clipboard says: {clean}"
+
+
+def empty_recycle_bin():
+    """Silently empty Windows Recycle Bin."""
+    if sys.platform == "win32":
+        try:
+            ctypes.WinDLL("shell32").SHEmptyRecycleBinW(None, None, 7)
+            return "Recycle bin emptied."
+        except Exception:
+            pass
+    return "Could not empty recycle bin."
+
+
+_MATH_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+    ast.Pow: operator.pow, ast.USub: operator.neg, ast.UAdd: operator.pos,
+}
+
+
+def _safe_eval(node):
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+    elif isinstance(node, ast.Constant):
+        return node.value
+    elif isinstance(node, ast.BinOp):
+        left = _safe_eval(node.left)
+        right = _safe_eval(node.right)
+        op_type = type(node.op)
+        if op_type in _MATH_OPS:
+            if op_type in (ast.Div, ast.FloorDiv, ast.Mod) and right == 0:
+                raise ZeroDivisionError
+            if op_type == ast.Pow and (abs(left) > 1000 or abs(right) > 100):
+                raise ValueError
+            return _MATH_OPS[op_type](left, right)
+        raise ValueError
+    elif isinstance(node, ast.UnaryOp):
+        operand = _safe_eval(node.operand)
+        op_type = type(node.op)
+        if op_type in _MATH_OPS:
+            return _MATH_OPS[op_type](operand)
+        raise ValueError
+    raise ValueError
+
+
+def quick_math(text):
+    """Safe zero-latency offline arithmetic evaluator."""
+    t = text.strip().lower()
+    t = re.sub(r"^(?:calculate|what is|what's|whats|solve|compute)\s+", "", t).strip()
+    t = re.sub(r"\s*\?+$", "", t).strip()
+    if m := re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:percent|%)\s+of\s+(\d+(?:\.\d+)?)", t):
+        val = float(m[1]) * float(m[2]) / 100.0
+        return f"{m[1]}% of {m[2]} is {int(val) if val.is_integer() else round(val, 4)}."
+    expr = t
+    for pat, rep in [(r"\bmultiplied by\b", "*"), (r"\btimes\b", "*"), (r"\bdivided by\b", "/"),
+                     (r"\bover\b", "/"), (r"\bplus\b", "+"), (r"\bminus\b", "-"),
+                     (r"\bto the power of\b", "**"), (r"\bx\b", "*")]:
+        expr = re.sub(pat, rep, expr)
+    expr = expr.strip()
+    if not re.fullmatch(r"[\d\s\+\-\*/\(\)\.\%]+", expr) or not re.search(r"[\+\-\*/]", expr):
+        return None
+    try:
+        tree = ast.parse(expr, mode="eval")
+        res = _safe_eval(tree)
+        if isinstance(res, (int, float)):
+            formatted = int(res) if isinstance(res, float) and res.is_integer() else (round(res, 4) if isinstance(res, float) else res)
+            return f"It's {formatted}."
+    except Exception:
+        return None
+    return None
 
 
 def window_text(h, fn="GetWindowTextW"):
@@ -506,7 +645,7 @@ PLEASANT = {"thank you", "thanks", "thank you so much", "thanks a lot", "ok", "o
             "yeah", "yep", "nope", "sure", "right", "oh", "wow", "hello", "hi", "hey"}
 ACTIONS = {"open_app", "focus_window", "open_url", "search_web", "type", "press", "window", "volume", "media",
            "powershell", "wait", "ui_list", "click", "scroll", "mouse", "zoom", "open_folder", "tab", "switch", "play",
-           "focus_input", "dictate"}
+           "focus_input", "dictate", "system_info", "clipboard"}
 FOLDERS = {"desktop": "shell:Desktop", "downloads": "shell:Downloads", "documents": "shell:Personal",
            "pictures": "shell:My Pictures", "music": "shell:My Music", "videos": "shell:My Video"}
 MAX_STEPS = 6
@@ -783,7 +922,13 @@ QUICK_KEYS = {"go back": "alt+left", "back": "alt+left", "go forward": "alt+righ
               "page down": "pagedown", "page up": "pageup", "full screen": "f11", "fullscreen": "f11",
               "switch window": "alt+tab", "switch app": "alt+tab", "show desktop": "win+d", "task view": "win+tab",
               "screenshot": "win+shift+s", "take a screenshot": "win+shift+s", "mute": "volumemute",
-              "unmute": "volumemute", "mute it": "volumemute"}
+              "unmute": "volumemute", "mute it": "volumemute",
+              "snap left": "win+left", "snap right": "win+right", "snap up": "win+up", "snap down": "win+down",
+              "tile left": "win+left", "tile right": "win+right",
+              "lock pc": "win+l", "lock screen": "win+l", "lock computer": "win+l",
+              "task manager": "ctrl+shift+esc", "open task manager": "ctrl+shift+esc",
+              "file explorer": "win+e", "open file explorer": "win+e",
+              "settings": "win+i", "open settings": "win+i", "windows settings": "win+i"}
 QUICK_WORDS = {"play": "playpause", "pause": "playpause", "resume": "playpause", "play pause": "playpause",
                "pause music": "playpause", "play music": "playpause", "stop music": "playpause",
                "pause it": "playpause", "play it": "playpause", "next song": "nexttrack", "next track": "nexttrack",
@@ -799,7 +944,8 @@ SPLIT_WORDS = [("you tube", "youtube"), ("g mail", "gmail"), ("face book", "face
                ("what's app", "whatsapp"), ("whats app", "whatsapp"), ("note pad", "notepad")]
 QUICK_PHRASES = [*QUICK_KEYS, *QUICK_WORDS, "scroll down", "scroll up", "scroll down a lot", "scroll up a lot", "click",
                  "double click", "right click", "zoom in", "zoom out", "volume up", "volume down", "close window",
-                 "minimize", "maximize"]
+                 "minimize", "maximize", "battery", "battery level", "ram usage", "memory usage",
+                 "read clipboard", "what app is this"]
 
 
 SITES = {"youtube": "https://www.youtube.com", "gmail": "https://mail.google.com", "google": "https://www.google.com",
@@ -850,6 +996,24 @@ def _quick_one(t, text, apps):
     if t in ("what is the date", "what's the date", "whats the date", "what day is it", "what is today's date",
              "today's date", "what is the day today", "what's today", "what day is today"):
         return time.strftime("Today is %A, %B %d.").replace(" 0", " "), []
+    if re.fullmatch(r"(?:what is |what's |tell me )?(?:the |my )?battery(?: level| percentage| status)?|"
+                    r"how much battery(?: do i have| is left)?(?: now)?", t):
+        return system_battery(), []
+    if re.fullmatch(r"(?:what is |what's |tell me )?(?:the |my )?(?:ram|memory|ram usage|memory usage)|"
+                    r"how much (?:ram|memory)(?: is free| is used)?(?: now)?", t):
+        return system_memory(), []
+    if re.fullmatch(r"(?:what|which) (?:app|window|program) is (?:this|open in front|active|current|focused)|"
+                    r"what am i looking at|current (?:window|app)", t):
+        return active_window_title(), []
+    if re.fullmatch(r"(?:what is |what's |tell me )?(?:on )?(?:my |the )?clipboard(?: contents)?|"
+                    r"read (?:my |the )?clipboard|what did i copy", t):
+        return clipboard_preview(), []
+    if t in ("empty recycle bin", "clear recycle bin", "empty the recycle bin", "clear the recycle bin", "empty trash", "clear trash"):
+        return empty_recycle_bin(), []
+    if re.fullmatch(r"(?:set )?(?:the )?volume (?:to )?(?:max|maximum|full|100%?)", t):
+        return "Volume max", [{"volume": "up 50"}]
+    if (math_ans := quick_math(text) or quick_math(t)) is not None:
+        return math_ans, []
     if m := re.fullmatch(r"(?:search google for|search for|google search|look up|search|google) (.+)", t):
         return "Searching", [{"search_web": m[1]}]
     if m := re.fullmatch(r"(?:(?:open|start|launch|run) )?(?:jupiter|jupyter)(?: (notebook|lab))?", t):  # no Start menu entry: it's a command
@@ -2297,7 +2461,9 @@ class Tracker:
                      "open_folder": ("Opening {}", "Opened {}"), "ui_list": ("Looking at the screen", "Looked"),
                      "wait": ("Waiting", "Waited"), "volume": ("Volume {}", "Volume {}"), "window": ("Window {}", "Window {}"),
                      "media": ("Media", "Media"), "mouse": ("Clicking", "Clicked"), "zoom": ("Zooming", "Zoomed"),
-                     "focus_input": ("Finding the text box", "Ready to type"), "dictate": ("Ready to type", "Ready to type")
+                     "focus_input": ("Finding the text box", "Ready to type"), "dictate": ("Ready to type", "Ready to type"),
+                     "system_info": ("Checking system status", "Checked system status"),
+                     "clipboard": ("Accessing clipboard", "Accessed clipboard")
                      }.get(kind, ("Working", "Done"))
         return (then if past else now).format(host[:40])
 
@@ -2388,6 +2554,25 @@ class Tracker:
             return ui_list()
         elif kind == "click":
             return ui_click(v)
+        elif kind == "system_info":
+            if v in ("battery", "power"):
+                return system_battery()
+            elif v in ("memory", "ram"):
+                return system_memory()
+            elif v in ("window", "app"):
+                return active_window_title()
+            return f"unknown system info '{v}'"
+        elif kind == "clipboard":
+            if v in ("read", "preview", "get"):
+                return clipboard_preview()
+            elif v == "clear":
+                if sys.platform == "win32" and u32.OpenClipboard(None):
+                    try:
+                        u32.EmptyClipboard()
+                        return "clipboard cleared"
+                    finally:
+                        u32.CloseClipboard()
+            return f"unknown clipboard action '{v}'"
 
     def _paste_key(self):
         key = clipboard_text()
@@ -3298,6 +3483,14 @@ def selftest():
     assert qc("click on trending")[1] == [{"click": "trending"}]
     assert qc("open youtube and click on trending")[1] == [{"open_url": "https://www.youtube.com"}, {"wait": "3.5"},
                                                          {"click": "trending"}]
+    assert qc("snap left")[1] == [{"press": "win+left"}]
+    assert qc("lock screen")[1] == [{"press": "win+l"}]
+    assert qc("what is 25 plus 15")[0] == "It's 40." and qc("what is 25 plus 15")[1] == []
+    assert qc("calculate 100 divided by 4")[0] == "It's 25."
+    assert qc("15 percent of 80")[0] == "15% of 80 is 12."
+    assert isinstance(qc("battery")[0], str)
+    assert isinstance(qc("memory usage")[0], str)
+    assert isinstance(qc("read clipboard")[0], str)
     assert qc("type cats and dogs")[1] == [{"type": "cats and dogs"}]  # "and" inside a request stays inside
     assert qc("Type Hello World.")[1] == [{"type": "Hello World"}]
     assert qc("write a note saying buy milk in notepad") is None  # too much for a shortcut: the AI plans it

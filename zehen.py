@@ -643,9 +643,38 @@ Chat, questions, advice, jokes and facts: answer in "say" and leave "do" empty. 
 PLEASANT = {"thank you", "thanks", "thank you so much", "thanks a lot", "ok", "okay", "cool", "nice", "great", "good", "awesome",
             "perfect", "bye", "goodbye", "that's all", "no thanks", "fine", "alright", "got it", "hmm", "yes", "no",
             "yeah", "yep", "nope", "sure", "right", "oh", "wow", "hello", "hi", "hey"}
+BLOCKED_PATTERNS = [
+    (r"\b(format[- ]volume|clear-disk|initialize-disk)\b|format\s+[a-z]:", "Disk format commands are blocked for system safety"),
+    (r"remove-item\s+.*[cC]:\\(windows|system32|\*|\s*$)|rmdir\s+/[sS]\s+.*[cC]:\\(windows|system32)?$", "Critical system directory deletion is blocked"),
+    (r"set-mppreference\s+-disablerealtime|disableantispyware", "Modifying system security and antivirus policies is blocked"),
+    (r"remove-item.*[cC]:\\users\\?\*", "Bulk user directory deletion is blocked"),
+]
+
+CONFIRM_PATTERNS = [
+    (r"\b(remove-item|del|rmdir|rd|erase|clear-content)\b", "delete files or directories"),
+    (r"\b(stop-computer|restart-computer|shutdown(\.exe)?\s+/[sSrR])\b", "shutdown or restart the computer"),
+    (r"\b(stop-process|taskkill(\.exe)?)\b", "terminate running processes"),
+]
+
+
+def audit_action_safety(kind, v):
+    """Safety firewall: blocks catastrophic system destruction and requires confirmation for destructive actions."""
+    if kind == "empty_recycle_bin":
+        return "needs_confirmation", "empty the recycle bin"
+    if kind == "powershell":
+        cmd = v.strip()
+        for pat, reason in BLOCKED_PATTERNS:
+            if re.search(pat, cmd, re.I):
+                return "blocked", reason
+        for pat, desc in CONFIRM_PATTERNS:
+            if re.search(pat, cmd, re.I):
+                return "needs_confirmation", desc
+    return "safe", None
+
+
 ACTIONS = {"open_app", "focus_window", "open_url", "search_web", "type", "press", "window", "volume", "media",
            "powershell", "wait", "ui_list", "click", "scroll", "mouse", "zoom", "open_folder", "tab", "switch", "play",
-           "focus_input", "dictate", "system_info", "clipboard"}
+           "focus_input", "dictate", "system_info", "clipboard", "empty_recycle_bin"}
 FOLDERS = {"desktop": "shell:Desktop", "downloads": "shell:Downloads", "documents": "shell:Personal",
            "pictures": "shell:My Pictures", "music": "shell:My Music", "videos": "shell:My Video"}
 MAX_STEPS = 6
@@ -1009,7 +1038,7 @@ def _quick_one(t, text, apps):
                     r"read (?:my |the )?clipboard|what did i copy", t):
         return clipboard_preview(), []
     if t in ("empty recycle bin", "clear recycle bin", "empty the recycle bin", "clear the recycle bin", "empty trash", "clear trash"):
-        return empty_recycle_bin(), []
+        return "Empty recycle bin", [{"empty_recycle_bin": ""}]
     if re.fullmatch(r"(?:set )?(?:the )?volume (?:to )?(?:max|maximum|full|100%?)", t):
         return "Volume max", [{"volume": "up 50"}]
     if (math_ans := quick_math(text) or quick_math(t)) is not None:
@@ -1142,6 +1171,8 @@ def run_powershell(cmd, timeout=30):
                            encoding="utf-8", errors="replace", timeout=timeout, creationflags=0x08000000)
     except subprocess.TimeoutExpired:
         return "(timed out after %ds)" % timeout
+    except Exception as e:
+        return f"(command failed: {e})"
     return ((r.stdout + r.stderr).strip() or "(no output)")[:1500]
 
 
@@ -1958,6 +1989,7 @@ class Tracker:
         self.ink, self.stroke, self.ink_at, self.recognizing = [], None, 0.0, False
         self.chunks, self.query, self.alts = [], "", []  # chunks: text the pad typed, so "⌫ word" can undo it
         self.windows, self.apps, self.search_cache = [], [], ("", [])
+        self.pending_action = None
         self.hover, self.pressed, self.pressed_until = None, None, 0.0
         self.flash, self.flash_until = "", 0.0
         self.pinch2, self.zoom_d0, self.zoom_since = False, None, 0.0
@@ -2337,6 +2369,20 @@ class Tracker:
     def _agent(self, text):
         """Voice: ask the model, do what it says, show it the output, repeat until done. Runs on the voice thread.
         Pausing (fist or ⏸) stops it between steps. Returns what to say back."""
+        # Safeguard: Check if user is confirming or cancelling a pending destructive action
+        if getattr(self, "pending_action", None) and (time.monotonic() - self.pending_action.get("time", 0) <= 35.0):
+            t_conf = " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+            pending = self.pending_action
+            if t_conf in ("confirm", "yes confirm", "yes", "yes proceed", "proceed", "yes do it", "do it", "sure proceed", "go ahead"):
+                self.pending_action = None
+                self._say(f"Confirmed. Executing {pending['desc']}...")
+                res = self._do(pending["kind"], pending["v"], confirmed=True)
+                return f"Confirmed. {pending['desc'].capitalize()} completed." if res is None else f"Confirmed. {res}"
+            elif t_conf in ("cancel", "no", "don't", "abort", "cancel that", "stop", "never mind", "nevermind", "no cancel"):
+                self.pending_action = None
+                return "Cancelled. No files or system settings were modified."
+        self.pending_action = None
+
         if m := re.search(r"\b(?:(?:turn|switch) (on|off) (?:the )?camera|camera (on|off)|(voice only|no camera))\b",
                           fold(text)):
             on = (m[1] or m[2]) == "on"
@@ -2383,6 +2429,8 @@ class Tracker:
             self._say(quick[0])
             out = [o for o in (self._do(*next(iter(a.items()))) for a in quick[1]) if o]
             self.memory = (self.memory + [f"{text} => {quick[0]}"])[-5:]
+            if warn := next((o for o in out if o.startswith(("Warning:", "Action blocked:"))), ""):
+                return warn
             lost = next((o for o in out if o.startswith(("no tab", "no window"))), "")
             if lost:  # tell her what is there, so you can say it again properly
                 return lost.replace("no tab like", "I can't find a tab like").replace("no window or tab like", "I can't find")
@@ -2421,6 +2469,8 @@ class Tracker:
                     self._say(self._describe(kind, v))  # shows in the pill while it works: what she is doing right now
                     if (o := self._do(kind, v)):
                         out.append(o)
+                        if o.startswith(("Warning:", "Action blocked:")):
+                            return o
                         if o.startswith("no "):
                             failed.append(o)
                         elif o.startswith(("opened", "switched", "playing", "clicked")):
@@ -2463,7 +2513,8 @@ class Tracker:
                      "media": ("Media", "Media"), "mouse": ("Clicking", "Clicked"), "zoom": ("Zooming", "Zoomed"),
                      "focus_input": ("Finding the text box", "Ready to type"), "dictate": ("Ready to type", "Ready to type"),
                      "system_info": ("Checking system status", "Checked system status"),
-                     "clipboard": ("Accessing clipboard", "Accessed clipboard")
+                     "clipboard": ("Accessing clipboard", "Accessed clipboard"),
+                     "empty_recycle_bin": ("Emptying recycle bin", "Emptied recycle bin")
                      }.get(kind, ("Working", "Done"))
         return (then if past else now).format(host[:40])
 
@@ -2473,8 +2524,17 @@ class Tracker:
         self.cfg["camera_on"] = on
         save_config(self.cfg)
 
-    def _do(self, kind, v):
+    def _do(self, kind, v, confirmed=False):
         """Run one model-chosen action; powershell returns its output so the model can see it."""
+        safety, reason = audit_action_safety(kind, v)
+        if safety == "blocked":
+            return f"Action blocked: {reason}."
+        if safety == "needs_confirmation" and not confirmed:
+            self.pending_action = {"kind": kind, "v": v, "desc": reason, "time": time.monotonic()}
+            if self.voice:
+                self.voice.follow = True
+            return f"Warning: This will {reason}. Are you sure? Say 'confirm' to proceed or 'cancel' to abort."
+
         if kind == "open_app":
             if m := search_apps(self.apps, v, 1):
                 launch(m[0][1])
@@ -2573,6 +2633,8 @@ class Tracker:
                     finally:
                         u32.CloseClipboard()
             return f"unknown clipboard action '{v}'"
+        elif kind == "empty_recycle_bin":
+            return empty_recycle_bin()
 
     def _paste_key(self):
         key = clipboard_text()
@@ -3634,6 +3696,13 @@ def selftest():
     try:
         assert t._agent("turn off the camera").startswith("Camera off") and not t.camera_on
         assert t._agent("camera on").startswith("Camera on") and t.camera_on
+        assert audit_action_safety("empty_recycle_bin", "") == ("needs_confirmation", "empty the recycle bin")
+        assert audit_action_safety("powershell", "Remove-Item log.txt") == ("needs_confirmation", "delete files or directories")
+        assert audit_action_safety("powershell", "Format-Volume D")[0] == "blocked"
+        assert audit_action_safety("powershell", "Get-Process") == ("safe", None)
+        warn_msg = t._agent("empty the recycle bin")
+        assert warn_msg.startswith("Warning: This will empty the recycle bin") and t.pending_action is not None
+        assert t._agent("cancel") == "Cancelled. No files or system settings were modified." and t.pending_action is None
     finally:
         globals()["save_config"] = real_save
     tone = lambda f0, f1: (np.sin(np.cumsum(np.linspace(f0, f1, 9600)) * 2 * np.pi / 16000) * 12000).astype(np.int16).tobytes()

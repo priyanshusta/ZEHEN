@@ -20,6 +20,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -412,6 +413,118 @@ def empty_recycle_bin():
     return "Could not empty recycle bin."
 
 
+class VoiceTimer:
+    """Non-blocking background voice timer with thread-safe controls and system alert."""
+
+    def __init__(self, on_alarm=None):
+        self._lock = threading.RLock()
+        self._timer = None
+        self._target_time = 0.0
+        self._duration_s = 0
+        self._label = ""
+        self.on_alarm = on_alarm
+
+    def start(self, seconds, label=None):
+        with self._lock:
+            self.cancel()
+            self._duration_s = seconds
+            self._target_time = time.monotonic() + seconds
+            if not label:
+                if seconds % 3600 == 0:
+                    h = seconds // 3600
+                    self._label = f"{h} hour" if h == 1 else f"{h} hours"
+                elif seconds % 60 == 0:
+                    m = seconds // 60
+                    self._label = f"{m} minute" if m == 1 else f"{m} minutes"
+                else:
+                    self._label = f"{seconds} second" if seconds == 1 else f"{seconds} seconds"
+            else:
+                self._label = label
+            self._timer = threading.Timer(seconds, self._fire)
+            self._timer.daemon = True
+            self._timer.start()
+        return f"Timer set for {self._label}."
+
+    def _fire(self):
+        with self._lock:
+            lbl = self._label
+            self._timer = None
+            self._target_time = 0.0
+        if sys.platform == "win32":
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+        if self.on_alarm:
+            self.on_alarm(lbl)
+
+    def status(self):
+        with self._lock:
+            if not self._timer or self._target_time <= 0:
+                return "No active timer."
+            left = max(0, int(self._target_time - time.monotonic()))
+        mins, secs = divmod(left, 60)
+        hours, mins = divmod(mins, 60)
+        parts = []
+        if hours > 0:
+            parts.append(f"{hours} hour" if hours == 1 else f"{hours} hours")
+        if mins > 0:
+            parts.append(f"{mins} minute" if mins == 1 else f"{mins} minutes")
+        if secs > 0 or not parts:
+            parts.append(f"{secs} second" if secs == 1 else f"{secs} seconds")
+        return f"You have {' and '.join(parts)} left on your timer."
+
+    def cancel(self):
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+                self._target_time = 0.0
+                return "Timer cancelled."
+            return "No active timer to cancel."
+
+
+_voice_timer = VoiceTimer()
+
+
+def system_network():
+    """Quick local IP discovery and connectivity status."""
+    ip = "unavailable"
+    connected = False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2.0)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        connected = True
+    except Exception:
+        pass
+    if connected:
+        return f"Connected to the network. Your local IP address is {ip}."
+    return "No active internet connection detected."
+
+
+def open_latest_download():
+    """Open the most recently modified non-temporary file in the user's Downloads folder."""
+    dl = Path.home() / "Downloads"
+    if not dl.exists() or not dl.is_dir():
+        return "Downloads folder not found."
+    try:
+        files = [f for f in dl.iterdir() if f.is_file() and not f.name.endswith((".tmp", ".crdownload", ".part", ".download"))]
+        if not files:
+            return "No downloaded files found."
+        newest = max(files, key=lambda f: f.stat().st_mtime)
+        if sys.platform == "win32":
+            os.startfile(str(newest))
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(newest)])
+        return f"Opened latest download: {newest.name}"
+    except Exception as e:
+        return f"Couldn't open latest download: {e}"
+
+
 _MATH_OPS = {
     ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
     ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
@@ -674,7 +787,7 @@ def audit_action_safety(kind, v):
 
 ACTIONS = {"open_app", "focus_window", "open_url", "search_web", "type", "press", "window", "volume", "media",
            "powershell", "wait", "ui_list", "click", "scroll", "mouse", "zoom", "open_folder", "tab", "switch", "play",
-           "focus_input", "dictate", "system_info", "clipboard", "empty_recycle_bin"}
+           "focus_input", "dictate", "system_info", "clipboard", "empty_recycle_bin", "timer", "network", "open_download"}
 FOLDERS = {"desktop": "shell:Desktop", "downloads": "shell:Downloads", "documents": "shell:Personal",
            "pictures": "shell:My Pictures", "music": "shell:My Music", "videos": "shell:My Video"}
 MAX_STEPS = 6
@@ -974,7 +1087,7 @@ SPLIT_WORDS = [("you tube", "youtube"), ("g mail", "gmail"), ("face book", "face
 QUICK_PHRASES = [*QUICK_KEYS, *QUICK_WORDS, "scroll down", "scroll up", "scroll down a lot", "scroll up a lot", "click",
                  "double click", "right click", "zoom in", "zoom out", "volume up", "volume down", "close window",
                  "minimize", "maximize", "battery", "battery level", "ram usage", "memory usage",
-                 "read clipboard", "what app is this"]
+                 "read clipboard", "what app is this", "network status", "timer status", "cancel timer", "open latest download"]
 
 
 SITES = {"youtube": "https://www.youtube.com", "gmail": "https://mail.google.com", "google": "https://www.google.com",
@@ -1039,6 +1152,18 @@ def _quick_one(t, text, apps):
         return clipboard_preview(), []
     if t in ("empty recycle bin", "clear recycle bin", "empty the recycle bin", "clear the recycle bin", "empty trash", "clear trash"):
         return "Empty recycle bin", [{"empty_recycle_bin": ""}]
+    if m := re.fullmatch(r"(?:set )?(?:a )?timer (?:for )?(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)", t):
+        num, unit = int(m[1]), m[2]
+        secs = num * (3600 if "h" in unit else 60 if "m" in unit else 1)
+        return _voice_timer.start(secs), []
+    if re.fullmatch(r"(?:how much time (?:is )?left(?: on the timer)?|timer status|check timer|time left)", t):
+        return _voice_timer.status(), []
+    if re.fullmatch(r"(?:cancel|stop|clear|delete|remove) (?:the )?timer", t):
+        return _voice_timer.cancel(), []
+    if re.fullmatch(r"(?:what is |what's |tell me )?(?:my )?(?:local )?ip(?: address)?|network status|internet status|am i connected(?: to the internet)?", t):
+        return system_network(), []
+    if re.fullmatch(r"(?:open|show|launch)(?: me)?(?: my)? (?:latest|recent|last) download(?:ed file)?", t):
+        return open_latest_download(), []
     if re.fullmatch(r"(?:set )?(?:the )?volume (?:to )?(?:max|maximum|full|100%?)", t):
         return "Volume max", [{"volume": "up 50"}]
     if (math_ans := quick_math(text) or quick_math(t)) is not None:
@@ -1990,6 +2115,7 @@ class Tracker:
         self.chunks, self.query, self.alts = [], "", []  # chunks: text the pad typed, so "⌫ word" can undo it
         self.windows, self.apps, self.search_cache = [], [], ("", [])
         self.pending_action = None
+        _voice_timer.on_alarm = lambda lbl: (self.voice.say(f"Your {lbl} timer is done.") if getattr(self, "voice", None) else None)
         self.hover, self.pressed, self.pressed_until = None, None, 0.0
         self.flash, self.flash_until = "", 0.0
         self.pinch2, self.zoom_d0, self.zoom_since = False, None, 0.0
@@ -2514,7 +2640,10 @@ class Tracker:
                      "focus_input": ("Finding the text box", "Ready to type"), "dictate": ("Ready to type", "Ready to type"),
                      "system_info": ("Checking system status", "Checked system status"),
                      "clipboard": ("Accessing clipboard", "Accessed clipboard"),
-                     "empty_recycle_bin": ("Emptying recycle bin", "Emptied recycle bin")
+                     "empty_recycle_bin": ("Emptying recycle bin", "Emptied recycle bin"),
+                     "timer": ("Managing timer", "Timer updated"),
+                     "network": ("Checking network", "Checked network"),
+                     "open_download": ("Opening download", "Opened download")
                      }.get(kind, ("Working", "Done"))
         return (then if past else now).format(host[:40])
 
@@ -2635,6 +2764,21 @@ class Tracker:
             return f"unknown clipboard action '{v}'"
         elif kind == "empty_recycle_bin":
             return empty_recycle_bin()
+        elif kind == "timer":
+            if v.startswith("start "):
+                try:
+                    return _voice_timer.start(int(v.split()[1]))
+                except Exception:
+                    return "Invalid timer duration"
+            elif v in ("status", "check"):
+                return _voice_timer.status()
+            elif v in ("cancel", "stop"):
+                return _voice_timer.cancel()
+            return f"unknown timer action '{v}'"
+        elif kind == "network":
+            return system_network()
+        elif kind == "open_download":
+            return open_latest_download()
 
     def _paste_key(self):
         key = clipboard_text()
@@ -3553,6 +3697,11 @@ def selftest():
     assert isinstance(qc("battery")[0], str)
     assert isinstance(qc("memory usage")[0], str)
     assert isinstance(qc("read clipboard")[0], str)
+    assert qc("set timer 10 seconds")[0] == "Timer set for 10 seconds." and qc("set timer 10 seconds")[1] == []
+    assert _voice_timer.status().startswith("You have")
+    assert _voice_timer.cancel() == "Timer cancelled."
+    assert isinstance(qc("network status")[0], str)
+    assert isinstance(qc("open latest download")[0], str)
     assert qc("type cats and dogs")[1] == [{"type": "cats and dogs"}]  # "and" inside a request stays inside
     assert qc("Type Hello World.")[1] == [{"type": "Hello World"}]
     assert qc("write a note saying buy milk in notepad") is None  # too much for a shortcut: the AI plans it
